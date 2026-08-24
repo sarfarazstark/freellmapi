@@ -26,15 +26,15 @@ Upstream development continues to be incorporated **manually** (see [Upstream Ma
 | Remote | URL | Purpose |
 |---|---|---|
 | `upstream` | https://github.com/tashfeenahmed/freellmapi | Base project we track |
-| `origin` | **not configured yet** | Where this fork will be published |
+| `origin` | https://github.com/sarfarazstark/freellmapi (**private**) | This independent repository |
 
 GitHub's Fork relationship is intentionally **not** used. Instead:
 
 - The repository stays independent and does **not** appear in upstream's Forks list.
-- Full upstream history is retained (`main` currently sits exactly on `upstream/main`).
+- Full upstream history is retained (the fork commits sit on top of `upstream/main`).
 - Git remotes are used to manually incorporate upstream development.
 
-When publishing for the first time, create an empty independent repo and attach it — do **not** use GitHub's Fork button:
+Publishing setup (completed 2026-08-24) — an empty independent repo was created and attached; do **not** use GitHub's Fork button:
 
 ```powershell
 gh repo create <your-name>/<your-repo> --public --disable-wiki
@@ -329,11 +329,11 @@ Recorded **2026-08-24** — re-verify before relying on these values:
 | Item | Value |
 |---|---|
 | Branch | `main` |
-| HEAD | `4774cf02a4e6c984e17298afbe25e7e61203c3ca` (== `upstream/main`, 0 ahead / 0 behind) |
+| Upstream base | `4774cf02a4e6c984e17298afbe25e7e61203c3ca` — the fork commits sit directly on top of it (`git log --oneline upstream/main..main`) |
 | Upstream remote | `https://github.com/tashfeenahmed/freellmapi` |
-| Origin remote | **not configured** |
-| Working tree | **not clean** — the entire fork patch (67 modified files) is uncommitted; `FORK-NOTES.md` untracked |
-| Committed? | **No** — nothing pushed anywhere; no origin exists yet |
+| Origin remote | `https://github.com/sarfarazstark/freellmapi` (**private**) |
+| Working tree | clean |
+| Committed/pushed? | **Yes** — fork commits published to `origin/main`; upstream updates remain manual-only |
 | Default community catalog | `https://naster17.github.io/freellmapi-catalog` |
 | Configuration variable | `COMMUNITY_CATALOG_BASE_URL` (unset ⇒ default above) |
 | Latest test/build status | See [Current Known Test/Build State](#current-known-testbuild-state) — all green except 2 known Windows-only bootstrap failures |
