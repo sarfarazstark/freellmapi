@@ -26,7 +26,7 @@ Upstream development continues to be incorporated **manually** (see [Upstream Ma
 | Remote | URL | Purpose |
 |---|---|---|
 | `upstream` | https://github.com/tashfeenahmed/freellmapi | Base project we track |
-| `origin` | https://github.com/sarfarazstark/freellmapi (**private**) | This independent repository |
+| `origin` | https://github.com/sarfarazstark/freellmapi (public) | This independent repository |
 
 GitHub's Fork relationship is intentionally **not** used. Instead:
 
@@ -331,7 +331,7 @@ Recorded **2026-08-24** — re-verify before relying on these values:
 | Branch | `main` |
 | Upstream base | `4774cf02a4e6c984e17298afbe25e7e61203c3ca` — the fork commits sit directly on top of it (`git log --oneline upstream/main..main`) |
 | Upstream remote | `https://github.com/tashfeenahmed/freellmapi` |
-| Origin remote | `https://github.com/sarfarazstark/freellmapi` (**private**) |
+| Origin remote | `https://github.com/sarfarazstark/freellmapi` (public) |
 | Working tree | clean |
 | Committed/pushed? | **Yes** — fork commits published to `origin/main`; upstream updates remain manual-only |
 | Default community catalog | `https://naster17.github.io/freellmapi-catalog` |
