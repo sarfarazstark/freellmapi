@@ -67,6 +67,10 @@ const SETTING_PREVIOUS_JSON = 'catalog_previous_json';
 const SETTING_LAST_SYNC_MS = 'catalog_last_sync_ms';
 const SETTING_LAST_ERROR = 'catalog_last_error';
 export const SETTING_CATALOG_SOURCE = 'catalog_source';
+// User-manageable community catalog sources. Both live in the existing
+// settings key/value table — deliberately no new tables or migrations.
+export const SETTING_COMMUNITY_SOURCES = 'community_catalog_sources'; // JSON array of user-added sources
+export const SETTING_COMMUNITY_ACTIVE_SOURCE = 'community_catalog_active_source'; // active source id
 
 export type CatalogSource = 'official' | 'community';
 
@@ -84,9 +88,192 @@ export function officialCatalogBaseUrl(): string {
 
 export function catalogBaseUrl(source: CatalogSource = catalogSource()): string {
   if (source === 'community') {
-    return (process.env.COMMUNITY_CATALOG_BASE_URL ?? DEFAULT_COMMUNITY_BASE_URL).replace(/\/$/, '');
+    // Resolve through the community source registry; with no stored sources
+    // and no active id this reduces to the legacy env-var/default behavior.
+    const activeId = getSetting(SETTING_COMMUNITY_ACTIVE_SOURCE);
+    const active = activeId ? listCommunitySources().find((s) => s.id === activeId) : undefined;
+    return (active?.baseUrl ?? defaultCommunitySource().baseUrl).replace(/\/$/, '');
   }
   return officialCatalogBaseUrl();
+}
+
+/**
+ * User-manageable community catalog sources.
+ *
+ * The built-in default source is always synthesized from the env var — never
+ * stored, never deletable — so installs that only set COMMUNITY_CATALOG_BASE_URL
+ * keep behaving exactly as before. User-added sources live as one JSON array
+ * in the settings table. Trust is unchanged: everything resolved here rides
+ * the community (unsigned) policy keyed by source identity; official
+ * verification is never derived from a URL or hostname.
+ */
+export interface CommunityCatalogSource {
+  id: string;
+  name: string;
+  baseUrl: string;
+  /** true only for the synthesized built-in default. */
+  builtin?: boolean;
+  /** Set by listCommunitySources() per the active-id setting. */
+  active?: boolean;
+  createdAtMs?: number;
+  lastFetchedAtMs?: number | null;
+  lastFetchedVersion?: string | null;
+}
+
+/** Persisted shape for user-added sources (the default is never stored). */
+interface StoredCommunitySource {
+  id: string;
+  name: string;
+  baseUrl: string;
+  createdAtMs: number;
+  lastFetchedAtMs?: number | null;
+  lastFetchedVersion?: string | null;
+}
+
+function defaultCommunitySource(): CommunityCatalogSource {
+  return {
+    id: 'default',
+    name: 'Naster17',
+    baseUrl: (process.env.COMMUNITY_CATALOG_BASE_URL ?? DEFAULT_COMMUNITY_BASE_URL).replace(/\/$/, ''),
+    builtin: true,
+  };
+}
+
+function readStoredSources(): StoredCommunitySource[] {
+  const raw = getSetting(SETTING_COMMUNITY_SOURCES);
+  if (!raw) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (s): s is StoredCommunitySource =>
+        !!s &&
+        typeof s === 'object' &&
+        typeof (s as StoredCommunitySource).id === 'string' &&
+        typeof (s as StoredCommunitySource).name === 'string' &&
+        typeof (s as StoredCommunitySource).baseUrl === 'string',
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeStoredSources(sources: StoredCommunitySource[]): void {
+  setSetting(SETTING_COMMUNITY_SOURCES, JSON.stringify(sources));
+}
+
+function deleteSetting(key: string): void {
+  getDb().prepare('DELETE FROM settings WHERE key = ?').run(key);
+}
+
+/** Canonical form for duplicate detection: lowercase host, exact path, no trailing slash. */
+function normalizeSourceUrl(raw: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  // HTTPS everywhere except loopback http, which exists for local dev testing.
+  const loopback = parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1' || parsed.hostname === '[::1]';
+  if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && loopback)) return null;
+  if (parsed.username || parsed.password) return null;
+  return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, '')}`;
+}
+
+/** [built-in default, ...user-added sources], flagged active per the setting. */
+export function listCommunitySources(): CommunityCatalogSource[] {
+  const stored = readStoredSources();
+  const activeId = getSetting(SETTING_COMMUNITY_ACTIVE_SOURCE);
+  // An absent or unknown active id means the default is in charge.
+  const knownActive = activeId === 'default' || stored.some((s) => s.id === activeId);
+  return [
+    { ...defaultCommunitySource(), active: !knownActive || activeId === 'default' },
+    ...stored.map((s) => ({
+      id: s.id,
+      name: s.name,
+      baseUrl: s.baseUrl.replace(/\/+$/, ''),
+      active: knownActive && activeId === s.id,
+      createdAtMs: s.createdAtMs,
+      lastFetchedAtMs: s.lastFetchedAtMs ?? null,
+      lastFetchedVersion: s.lastFetchedVersion ?? null,
+    })),
+  ];
+}
+
+export function addCommunitySource(name: string, url: string): { source: CommunityCatalogSource } | { error: string } {
+  const trimmedName = name.trim();
+  if (trimmedName.length < 1) return { error: 'Enter a name for the catalog source.' };
+  if (trimmedName.length > 100) return { error: 'Source names are limited to 100 characters.' };
+  const normalized = normalizeSourceUrl(url);
+  if (!normalized) return { error: 'Enter a valid https:// catalog base URL.' };
+  const taken = new Set(listCommunitySources().map((s) => normalizeSourceUrl(s.baseUrl)));
+  if (taken.has(normalized)) return { error: 'A source with this catalog URL already exists.' };
+
+  const source: StoredCommunitySource = {
+    id: crypto.randomUUID(),
+    name: trimmedName,
+    baseUrl: normalized,
+    createdAtMs: Date.now(),
+    lastFetchedAtMs: null,
+    lastFetchedVersion: null,
+  };
+  writeStoredSources([...readStoredSources(), source]);
+  return { source: { ...source, active: false } };
+}
+
+export function deleteCommunitySource(id: string): { ok: true; wasActive: boolean } | { error: string } {
+  if (id === 'default') return { error: 'The built-in default source cannot be deleted' };
+  const stored = readStoredSources();
+  if (!stored.some((s) => s.id === id)) return { error: 'Unknown catalog source.' };
+  writeStoredSources(stored.filter((s) => s.id !== id));
+  // Deleting the active source clears the selection so the app falls back to
+  // the built-in default — it is never left without a community source.
+  const wasActive = getSetting(SETTING_COMMUNITY_ACTIVE_SOURCE) === id;
+  if (wasActive) deleteSetting(SETTING_COMMUNITY_ACTIVE_SOURCE);
+  return { ok: true, wasActive };
+}
+
+export function setActiveCommunitySource(id: string): { ok: true } | { error: string } {
+  if (!listCommunitySources().some((s) => s.id === id)) return { error: 'Unknown catalog source.' };
+  setSetting(SETTING_COMMUNITY_ACTIVE_SOURCE, id);
+  return { ok: true };
+}
+
+/**
+ * Dry-run validation of a community catalog endpoint: fetches /v1/latest and
+ * runs the exact same structural checks and version floor as syncCatalog, but
+ * NEVER applies anything and NEVER touches the applied-* bookkeeping. Lets the
+ * UI preview a feed before pointing the router at it.
+ */
+export async function inspectCommunityCatalog(
+  baseUrl: string,
+): Promise<{ ok: true; summary: CatalogSnapshotSummary } | { ok: false; error: string }> {
+  try {
+    const res = await fetch(`${baseUrl.replace(/\/$/, '')}/v1/latest`, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`catalog fetch failed: HTTP ${res.status}`);
+    const bytes = Buffer.from(await res.arrayBuffer());
+    const parsed: unknown = JSON.parse(bytes.toString('utf8'));
+    if (!isCatalog(parsed)) throw new Error('catalog payload has unexpected shape');
+    if (parsed.version < MIN_CATALOG_VERSION) {
+      throw new Error(`catalog version ${parsed.version} is older than the bundled baseline (${MIN_CATALOG_VERSION})`);
+    }
+    return { ok: true, summary: summarizeCatalog(parsed) };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/** Stamp fetch telemetry onto a stored user source (no-op for the builtin). */
+export function recordSourceFetch(id: string, version: string): void {
+  const stored = readStoredSources();
+  const target = stored.find((s) => s.id === id);
+  if (!target) return; // builtin 'default' (never stored) or already deleted
+  target.lastFetchedAtMs = Date.now();
+  target.lastFetchedVersion = version;
+  writeStoredSources(stored);
 }
 
 function catalogPublicKey(): crypto.KeyObject {

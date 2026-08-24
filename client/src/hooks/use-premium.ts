@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { apiFetch } from '@/lib/api'
+import { apiFetch, getToken } from '@/lib/api'
 
 export interface LicenseStatus {
   valid: boolean
@@ -79,4 +79,53 @@ export function usePremium() {
     ...query,
     licensed: Boolean(query.data?.hasKey && query.data.license?.valid),
   }
+}
+
+/** One entry of GET /api/premium/catalog-sources (mirrors CommunityCatalogSource). */
+export interface CommunityCatalogSource {
+  id: string
+  name: string
+  baseUrl: string
+  /** true only for the synthesized built-in default (id 'default'). */
+  builtin?: boolean
+  /** Set by the server per the active-source setting. */
+  active?: boolean
+  createdAtMs?: number
+  lastFetchedAtMs?: number | null
+  lastFetchedVersion?: string | null
+}
+
+export interface CatalogSourcesResponse {
+  sources: CommunityCatalogSource[]
+}
+
+/** POST /api/premium/catalog-sources/:id/fetch — always 200, outcome is data. */
+export type CommunitySourceFetchResult =
+  | { ok: true; summary: CatalogSnapshotSummary }
+  | { ok: false; error: string }
+
+// The catalog-source endpoints answer 400 with `{ error: '<message>' }`, not
+// the `{ error: { message } }` shape apiFetch unwraps, so these calls read the
+// body themselves to surface the server's message verbatim.
+export async function catalogSourceRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+  const token = getToken()
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  const res = await fetch(`${import.meta.env.BASE_URL.replace(/\/$/, '')}${path}`, { ...init, headers })
+  const body = (await res.json().catch(() => null)) as unknown
+  if (!res.ok) {
+    const message = (body as { error?: unknown } | null)?.error
+    throw new Error(typeof message === 'string' ? message : `HTTP ${res.status}`)
+  }
+  return body as T
+}
+
+export function useCommunitySources(enabled = true) {
+  return useQuery<CommunityCatalogSource[]>({
+    queryKey: ['catalog-sources'],
+    queryFn: async () =>
+      (await catalogSourceRequest<CatalogSourcesResponse>('/api/premium/catalog-sources')).sources,
+    enabled,
+  })
 }

@@ -49,6 +49,7 @@ The single feature area of this fork is a **configurable community model catalog
 - **Configurable community catalog** — the community feed is a URL, not a hardcoded service (`COMMUNITY_CATALOG_BASE_URL`, default below).
 - **Naster17 as current default community catalog** — `https://naster17.github.io/freellmapi-catalog` is only the default *value*; nothing else about Naster17 is imported.
 - **Community catalog source selection** — DB setting `catalog_source` (`'official' | 'community'`, default `'community'` when unset), switched from the Premium page or `PUT /api/premium/catalog-source`.
+- **User-manageable community sources** — multiple saved community feeds with add / fetch-validate / select / delete from the Premium page; no rebuild, no restart. See [Community Catalog Sources](#community-catalog-sources).
 - **Community unsigned-catalog trust policy** — community responses are structurally validated but deliberately **not** signature-verified; official responses always are.
 - **Catalog synchronization** — manual sync plus a scheduled poll (10 s after boot, then every 12 h) and boot-time re-apply of the cached catalog.
 - **Snapshot/diff reporting** — every applied catalog is summarized and diffed against the previous one (added/removed/changed models, quirk changes) in the Premium page.
@@ -88,6 +89,7 @@ A configurable community URL can never bypass official verification: pointing `C
 | Endpoint consumed | `<base>/v1/latest` |
 | Environment variable | `COMMUNITY_CATALOG_BASE_URL` (trailing slash stripped) |
 | Source identity | DB setting `catalog_source`; `'official' \| 'community'`; default `'community'` |
+| User-managed feeds | settings keys `community_catalog_sources` + `community_catalog_active_source` — see [Community Catalog Sources](#community-catalog-sources) |
 
 Override without any code change:
 
@@ -96,6 +98,28 @@ $env:COMMUNITY_CATALOG_BASE_URL = 'https://example.com/catalog'
 ```
 
 Then **restart the server** — the variable is read at process start; a running server does not pick it up. Manual sync or the next scheduled sync then uses the new URL.
+
+**No-restart alternative:** Premium → Source: Community → **Manage sources** adds and switches feeds at runtime (below).
+
+## Community Catalog Sources
+
+User-managed community feeds, curated entirely from the UI:
+
+- **Official stays separate.** The official source is not part of this registry; selecting Official always uses the Ed25519-verified endpoint.
+- **Multiple community sources.** Any number of named feeds (name + base URL) can be saved; the active one serves `<base>/v1/latest`.
+- **Persistence** — two keys in the existing settings key/value store (**no migration, no table**):
+  - `community_catalog_sources` — JSON array of user-added `{ id, name, baseUrl, createdAtMs, lastFetchedAtMs?, lastFetchedVersion? }`
+  - `community_catalog_active_source` — id of the active community source
+- **Built-in default.** Naster17 is synthesized, never stored, never deletable; its URL resolves as `COMMUNITY_CATALOG_BASE_URL ?? https://naster17.github.io/freellmapi-catalog`. An empty registry plus no active id reproduces the pre-registry behavior exactly.
+- **UI**: Premium → Source: Community → **Manage sources** — add a source (name + URL), fetch/validate it (dry-run), select/use it, delete it.
+- **API** (same auth as the rest of `/api/premium`):
+  - `GET /api/premium/catalog-sources`
+  - `POST /api/premium/catalog-sources` `{ name, url }`
+  - `DELETE /api/premium/catalog-sources/:id` — built-in rejected; deleting the *active* source falls back to the default and re-syncs immediately
+  - `POST /api/premium/catalog-sources/:id/fetch` — dry-run validation (`isCatalog()` + version floor), **never applies**
+  - `POST /api/premium/catalog-sources/:id/select` — sets active + runs the normal `syncCatalog(true)` path
+- **Security**: official Ed25519 verification unchanged; trust identity is never derived from a URL or hostname; community URLs require HTTPS except loopback http (`localhost`/`127.0.0.1`/`[::1]`); credentials embedded in URLs are rejected; `isCatalog()` and the `MIN_CATALOG_VERSION` floor apply to fetch and select alike.
+- **Maintenance**: future catalog repositories need **no application build and no environment change** — publish the catalog, then add its URL via Manage Sources. The implementation lives inside the same `catalog-sync.ts` fork block as everything else; upstream rewrites should follow the [merge guidance](#known-conflict-areas).
 
 ## Future Catalog Repository
 
@@ -126,6 +150,8 @@ The application does not care how the catalog is produced. Its only contract is 
 3. Change `COMMUNITY_CATALOG_BASE_URL`.
 4. Restart the server.
 5. Trigger/check catalog synchronization (Premium page → Check for updates, or `POST /api/premium/sync`).
+
+**No-restart alternative:** skip steps 3–4 entirely — add the published URL via Premium → Manage sources and select it. Future catalog repositories require **no application build**; a compatible `<base>/v1/latest` is the only contract.
 
 ## Catalog Contract
 
@@ -174,7 +200,7 @@ Additional behaviors that follow from the implementation:
 ```
 PremiumPage ("Check for updates")
         ↓
-POST /api/premium/sync   (or PUT /api/premium/catalog-source, or the 12 h scheduler)
+POST /api/premium/sync   (or PUT /api/premium/catalog-source, POST /api/premium/catalog-sources/:id/select, or the 12 h scheduler)
         ↓
 selected catalog source (catalog_source setting)
         ↓
@@ -221,18 +247,20 @@ Files most likely to conflict with upstream development:
 
 | File | Local behavior to preserve |
 |---|---|
-| `server/src/services/catalog-sync.ts` | Source selection block (`CatalogSource`, `catalogSource()`, `setCatalogSource()`, `catalogBaseUrl()`), the `if (source === 'official')` signature gate, applied-source bookkeeping (`SETTING_APPLIED_SOURCE` in the re-apply decision), community default URL |
-| `server/src/routes/premium.ts` | `PUT /api/premium/catalog-source`, license/portal URLs pinned to the official base |
-| `client/src/hooks/use-premium.ts` | `source`/snapshot/diff types on `CatalogSyncState` |
-| `client/src/pages/PremiumPage.tsx` | Source picker, community-unsigned note, snapshot metric + comparison panels |
-| `client/src/i18n/locales/*.json` | `premium.source*`, snapshot/diff keys (all 60 locales) |
-| `server/src/__tests__/services/catalog-sync*.test.ts` | Source-verification and scheduler coverage |
+| `server/src/services/catalog-sync.ts` | Source selection block (`CatalogSource`, `catalogSource()`, `setCatalogSource()`, `catalogBaseUrl()`), the `if (source === 'official')` signature gate, applied-source bookkeeping (`SETTING_APPLIED_SOURCE` in the re-apply decision), community default URL, community source registry (`SETTING_COMMUNITY_SOURCES`, `SETTING_COMMUNITY_ACTIVE_SOURCE`, `listCommunitySources()`/`addCommunitySource()`/`deleteCommunitySource()`/`setActiveCommunitySource()`/`inspectCommunityCatalog()`/`recordSourceFetch()`) |
+| `server/src/routes/premium.ts` | `PUT /api/premium/catalog-source`, the `/api/premium/catalog-sources*` routes, license/portal URLs pinned to the official base |
+| `client/src/hooks/use-premium.ts` | `source`/snapshot/diff types on `CatalogSyncState`; `CommunityCatalogSource` types + `catalogSourceRequest()` |
+| `client/src/pages/PremiumPage.tsx` | Source picker, Manage-sources entry point, community-unsigned note, snapshot metric + comparison panels |
+| `client/src/components/community-sources-dialog.tsx` | Entirely fork-owned (sources management dialog) |
+| `client/src/i18n/locales/*.json` | `premium.source*`, snapshot/diff, catalog-source keys (all 60 locales) |
+| `server/src/__tests__/services/catalog-sync*.test.ts` + `catalog-sources.test.ts` | Source-verification, scheduler, and registry coverage |
 
-Merge guidance for `catalog-sync.ts`: keep **upstream's** `isCatalog()` and `applyCatalog()` unless there is a deliberate, reviewed reason to change them. If upstream substantially rewrites the service, re-graft the three isolated local pieces:
+Merge guidance for `catalog-sync.ts`: keep **upstream's** `isCatalog()` and `applyCatalog()` unless there is a deliberate, reviewed reason to change them. If upstream substantially rewrites the service, re-graft the four isolated local pieces:
 
 1. the `CatalogSource` / `catalogSource()` / `catalogBaseUrl()` selection block,
 2. the `if (source === 'official')` signature gate in `syncCatalog()`,
-3. applied-source bookkeeping in the re-apply decision (`sameAsApplied` triple + `SETTING_APPLIED_SOURCE` writes).
+3. applied-source bookkeeping in the re-apply decision (`sameAsApplied` triple + `SETTING_APPLIED_SOURCE` writes),
+4. the community source registry block (settings keys, `defaultCommunitySource()`, list/add/delete/setActive/inspect helpers) and the registry-aware `catalogBaseUrl('community')` branch.
 
 Then port the source-verification tests back until they pass.
 
@@ -257,16 +285,16 @@ Purpose: keep the downstream patch small and upstream-compatible.
 
 ## Current Known Test/Build State
 
-Verified on **2026-08-24** against the current tree (HEAD `4774cf02` + uncommitted fork patch):
+Verified on **2026-08-24** against the current tree (commits through `0ba1dad` + uncommitted community-sources patch):
 
 | Check | Command | Result |
 |---|---|---|
-| Catalog tests | `npm run test -w server -- src/__tests__/services/catalog-sync.test.ts src/__tests__/services/catalog-sync-scheduler.test.ts src/__tests__/services/catalog-sync-source.test.ts` | ✅ 55/55 (41 + 6 + 8) |
+| Catalog tests | `npm run test -w server -- src/__tests__/services/catalog-sync.test.ts src/__tests__/services/catalog-sync-scheduler.test.ts src/__tests__/services/catalog-sync-source.test.ts src/__tests__/services/catalog-sources.test.ts` | ✅ 66/66 (41 + 6 + 8 + 11) |
 | Hooks | `npm run test:hooks` | ✅ 9/9 |
 | Migrations roundtrip | `npm run test:migrations` | ✅ 3/3 |
 | Build (= typecheck server+cli+client) | `npm run build` | ✅ passes (pre-existing Vite chunk-size + `__dirname` config warnings) |
 | Client tests | `npm run test -w client` | ✅ 243/243 (22 files) |
-| i18n check | `npm run check:i18n` | ✅ 60 locales / 1059 keys |
+| i18n check | `npm run check:i18n` | ✅ 60 locales / 1071 keys |
 | Bootstrap | `npm run test:bootstrap` | ❌ 2 known **Windows-only** failures (`Get-FileHash` unavailable under `powershell.exe` in this environment; bash variants skip) — pre-existing, unrelated to the fork patch |
 
 Not re-run this session (untouched by the patch, HEAD == upstream/main): the remainder of the server suite and the cli suite. Full gate remains `npm test`.
@@ -311,11 +339,13 @@ Treat this file as project-specific maintenance guidance — it does not overrid
 
 | File | Why it matters |
 |---|---|
-| `server/src/services/catalog-sync.ts` | Heart of the fork: source selection, Ed25519/community policies, `isCatalog()`, `applyCatalog()`, sync engine, snapshot/diff, scheduler, env-var handling |
-| `server/src/routes/premium.ts` | REST surface: `GET /api/premium`, `POST /key`, `DELETE /key`, `PUT /catalog-source`, `POST /sync`, `POST /portal` |
-| `client/src/hooks/use-premium.ts` | Client types mirroring `CatalogSyncState` etc.; `usePremium()` query |
-| `client/src/pages/PremiumPage.tsx` | Source picker, snapshot metrics, comparison/diff panels, unsigned-community note |
+| `server/src/services/catalog-sync.ts` | Heart of the fork: source selection, community source registry, Ed25519/community policies, `isCatalog()`, `applyCatalog()`, sync engine, snapshot/diff, scheduler, env-var handling |
+| `server/src/routes/premium.ts` | REST surface: `GET /api/premium`, `POST /key`, `DELETE /key`, `PUT /catalog-source`, `/catalog-sources*` CRUD/fetch/select, `POST /sync`, `POST /portal` |
+| `client/src/hooks/use-premium.ts` | Client types mirroring `CatalogSyncState`/`CommunityCatalogSource`; `usePremium()`, `useCommunitySources()`, `catalogSourceRequest()` |
+| `client/src/pages/PremiumPage.tsx` | Source picker, Manage-sources entry point, snapshot metrics, comparison/diff panels, unsigned-community note |
+| `client/src/components/community-sources-dialog.tsx` | Fork-owned dialog: add/fetch/use/delete community sources |
 | `server/src/__tests__/services/catalog-sync.test.ts` | Apply/re-apply/media/transcription/video + source-verification coverage (41 tests) |
+| `server/src/__tests__/services/catalog-sources.test.ts` | Source registry CRUD/validation/fetch/select/compat coverage (11 tests) |
 | `server/src/__tests__/services/catalog-sync-scheduler.test.ts` | Scheduler timing, kill switch, configured community URL (6 tests) |
 | `server/src/__tests__/services/catalog-sync-source.test.ts` | Upstream-owned provenance rules (`source='user'` vs `'catalog'`) |
 | `client/src/i18n/locales/*.json` | `premium.*` fork keys across all 60 locales (en.json is canonical) |
@@ -332,8 +362,8 @@ Recorded **2026-08-24** — re-verify before relying on these values:
 | Upstream base | `4774cf02a4e6c984e17298afbe25e7e61203c3ca` — the fork commits sit directly on top of it (`git log --oneline upstream/main..main`) |
 | Upstream remote | `https://github.com/tashfeenahmed/freellmapi` |
 | Origin remote | `https://github.com/sarfarazstark/freellmapi` (public) |
-| Working tree | clean |
-| Committed/pushed? | **Yes** — fork commits published to `origin/main`; upstream updates remain manual-only |
+| Working tree | **not clean** — the user-manageable community sources feature is implemented but uncommitted |
+| Committed/pushed? | Through `0ba1dad` yes (published to `origin/main`); the community-sources work awaits its own commit; upstream updates remain manual-only |
 | Default community catalog | `https://naster17.github.io/freellmapi-catalog` |
 | Configuration variable | `COMMUNITY_CATALOG_BASE_URL` (unset ⇒ default above) |
 | Latest test/build status | See [Current Known Test/Build State](#current-known-testbuild-state) — all green except 2 known Windows-only bootstrap failures |

@@ -5,10 +5,16 @@ import {
   SETTING_LICENSE_KEY,
   SETTING_LICENSE_STATUS,
   type CatalogSource,
+  addCommunitySource,
+  deleteCommunitySource,
   getCachedLicenseStatus,
   getSyncState,
+  inspectCommunityCatalog,
+  listCommunitySources,
   officialCatalogBaseUrl,
+  recordSourceFetch,
   refreshLicenseStatus,
+  setActiveCommunitySource,
   setCatalogSource,
   syncCatalog,
 } from '../services/catalog-sync.js';
@@ -137,4 +143,68 @@ premiumRouter.post('/portal', async (_req: Request, res: Response) => {
   } catch {
     res.status(502).json({ error: 'Could not reach the billing service. Try again shortly.' });
   }
+});
+
+/** GET /api/premium/catalog-sources — the built-in default plus user-added community feeds. */
+premiumRouter.get('/catalog-sources', (_req: Request, res: Response) => {
+  res.json({ sources: listCommunitySources() });
+});
+
+/** POST /api/premium/catalog-sources { name, url } — add a community feed. */
+premiumRouter.post('/catalog-sources', (req: Request, res: Response) => {
+  const name = typeof req.body?.name === 'string' ? req.body.name : '';
+  const url = typeof req.body?.url === 'string' ? req.body.url : '';
+  const result = addCommunitySource(name, url);
+  if ('error' in result) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  res.json({ sources: listCommunitySources() });
+});
+
+/**
+ * DELETE /api/premium/catalog-sources/:id — remove a user-added feed.
+ * Deleting the ACTIVE feed re-syncs immediately so the router falls back to
+ * the built-in default without waiting for the next poll.
+ */
+premiumRouter.delete('/catalog-sources/:id', async (req: Request, res: Response) => {
+  const result = deleteCommunitySource(String(req.params.id));
+  if ('error' in result) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  if (!result.wasActive) {
+    res.json({ sources: listCommunitySources() });
+    return;
+  }
+  const sync = await syncCatalog(true);
+  res.json({ sources: listCommunitySources(), ...statusPayload(), sync });
+});
+
+/**
+ * POST /api/premium/catalog-sources/:id/fetch — dry-run validation of a feed.
+ * The outcome is data, not transport failure: always 200 with either the
+ * snapshot summary or the reason the payload was rejected. Never applies.
+ */
+premiumRouter.post('/catalog-sources/:id/fetch', async (req: Request, res: Response) => {
+  const source = listCommunitySources().find((s) => s.id === String(req.params.id));
+  if (!source) {
+    res.status(400).json({ error: 'Unknown catalog source.' });
+    return;
+  }
+  const result = await inspectCommunityCatalog(source.baseUrl);
+  if (result.ok) recordSourceFetch(source.id, result.summary.version);
+  res.json(result);
+});
+
+/** POST /api/premium/catalog-sources/:id/select — make a community feed active and re-sync now. */
+premiumRouter.post('/catalog-sources/:id/select', async (req: Request, res: Response) => {
+  const result = setActiveCommunitySource(String(req.params.id));
+  if ('error' in result) {
+    res.status(400).json({ error: result.error });
+    return;
+  }
+  setCatalogSource('community');
+  const sync = await syncCatalog(true);
+  res.json({ ...statusPayload(), sync });
 });

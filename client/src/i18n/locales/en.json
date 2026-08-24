@@ -959,7 +959,19 @@
     "changeFieldCapabilities": "capabilities",
     "changeFieldMetadata": "metadata",
     "communityUnsignedNote": "Community feed: this catalog is maintained by a community member and is not signed by freellmapi.co.",
-    "appliedFrom": "Applied: {source}"
+    "appliedFrom": "Applied: {source}",
+    "manageSources": "Manage sources",
+    "sourcesTitle": "Community catalog sources",
+    "addSource": "Add source",
+    "sourceNameLabel": "Name",
+    "sourceUrlLabel": "Catalog base URL",
+    "saveSource": "Add",
+    "fetchSource": "Fetch and validate this catalog",
+    "deleteSource": "Delete this source",
+    "useSource": "Use this source",
+    "activeSourceBadge": "Active",
+    "defaultSourceBadge": "Default",
+    "builtinSourceNote": "Built-in default — its URL comes from server configuration."
   },
   "languages": {
     "en": "English",

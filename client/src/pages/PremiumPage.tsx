@@ -23,6 +23,7 @@ import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@
 import { Dialog, DialogClose, DialogPopup, DialogTitle } from '@/components/ui/dialog'
 import { FieldError } from '@/components/ui/field-error'
 import { CardSkeleton } from '@/components/ui/skeleton'
+import { CommunitySourcesDialog } from '@/components/community-sources-dialog'
 import { usePremium, type CatalogModelChange } from '@/hooks/use-premium'
 import { useI18n } from '@/i18n'
 
@@ -201,6 +202,7 @@ export default function PremiumPage() {
   const [activateAttempted, setActivateAttempted] = useState(false)
   const [expandedBuckets, setExpandedBuckets] = useState<Partial<Record<ChangeBucketKey, boolean>>>({})
   const [detailBucket, setDetailBucket] = useState<ChangeBucketKey | null>(null)
+  const [sourcesOpen, setSourcesOpen] = useState(false)
 
   const { data, isLoading, licensed } = usePremium()
 
@@ -402,7 +404,18 @@ export default function PremiumPage() {
                     : t('premium.snapshotDescription')}
                 </p>
                 {catalogSource === 'community' && (
-                  <p className="text-xs text-muted-foreground">{t('premium.communityUnsignedNote')}</p>
+                  <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+                    <p className="text-xs text-muted-foreground">{t('premium.communityUnsignedNote')}</p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="xs"
+                      onClick={() => setSourcesOpen(true)}
+                    >
+                      <SlidersHorizontal />
+                      {t('premium.manageSources')}
+                    </Button>
+                  </div>
                 )}
               </div>
               <div className="flex flex-col gap-2 sm:items-end">
@@ -648,6 +661,8 @@ export default function PremiumPage() {
           }}
         />
       )}
+
+      <CommunitySourcesDialog open={sourcesOpen} onOpenChange={setSourcesOpen} />
     </div>
   )
 }
