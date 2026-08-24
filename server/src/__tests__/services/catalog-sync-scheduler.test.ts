@@ -32,7 +32,9 @@ describe('startCatalogSync / stopCatalogSync', () => {
 
   afterEach(() => {
     stopCatalogSync();
+    vi.unstubAllGlobals();
     delete process.env.CATALOG_SYNC_DISABLED;
+    delete process.env.COMMUNITY_CATALOG_BASE_URL;
   });
 
   it('registers a 10-second boot delay and a 12-hour interval', () => {
@@ -77,5 +79,21 @@ describe('startCatalogSync / stopCatalogSync', () => {
     startCatalogSync(s2);
     expect(after).toHaveLength(1);
     expect(every).toHaveLength(1);
+  });
+
+  it('scheduled interval targets the configured community URL', async () => {
+    process.env.COMMUNITY_CATALOG_BASE_URL = 'https://catalog.example.me/v-root';
+    let requestedUrl = '';
+    vi.stubGlobal('fetch', vi.fn(async (input: URL | RequestInfo) => {
+      requestedUrl = String(input);
+      return new Response(JSON.stringify({ version: '2000.01.01', tier: 'monthly', models: [], quirks: [] }));
+    }));
+
+    const { scheduler, every } = makeScheduler();
+    startCatalogSync(scheduler);
+    every[0].fn();
+    await vi.waitFor(() => expect(requestedUrl).not.toBe(''));
+
+    expect(requestedUrl).toBe('https://catalog.example.me/v-root/v1/latest');
   });
 });

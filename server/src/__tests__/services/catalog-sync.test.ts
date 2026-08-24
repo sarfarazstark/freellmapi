@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import crypto from 'crypto';
+import { describe, it, expect, beforeAll, afterEach, vi } from 'vitest';
 import { initDb, getDb, setSetting, getSetting } from '../../db/index.js';
-import { applyCatalog, reapplyCachedCatalog, MIN_CATALOG_VERSION } from '../../services/catalog-sync.js';
+import { applyCatalog, reapplyCachedCatalog, MIN_CATALOG_VERSION, catalogBaseUrl, catalogSource, getSyncState, setCatalogSource, syncCatalog } from '../../services/catalog-sync.js';
 import { runMigrationsSync } from '../../db/migrate/runner.js';
 import { recordCatalogModelTombstone, upsertModelOverrides } from '../../services/model-state.js';
 
@@ -654,5 +655,162 @@ describe('applyCatalog: generative media meta', () => {
     (catalog.models[catalog.models.length - 2] as any).requestStyle = 42;
     setSetting('catalog_applied_json', JSON.stringify(catalog));
     expect(reapplyCachedCatalog().reapplied).toBe(false);
+  });
+});
+
+describe('syncCatalog source verification', () => {
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    delete process.env.COMMUNITY_CATALOG_BASE_URL;
+    delete process.env.CATALOG_PUBKEY;
+  });
+
+  it('defaults to the community feed when unconfigured', () => {
+    delete process.env.COMMUNITY_CATALOG_BASE_URL;
+    delete process.env.CATALOG_BASE_URL;
+    expect(catalogBaseUrl()).toBe('https://naster17.github.io/freellmapi-catalog');
+    expect(catalogSource()).toBe('community');
+  });
+
+  it('honors a configured community catalog URL', () => {
+    process.env.COMMUNITY_CATALOG_BASE_URL = 'https://catalog.example.me/v-root/';
+    expect(catalogBaseUrl()).toBe('https://catalog.example.me/v-root');
+  });
+
+  it('accepts unsigned catalogs from the community source', async () => {
+    process.env.COMMUNITY_CATALOG_BASE_URL = 'https://community.example';
+    setCatalogSource('community');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(catalogOf(existingAsCatalogModels())))));
+
+    const result = await syncCatalog(true);
+
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe('applied');
+    expect(getSetting('catalog_applied_source')).toBe('community');
+  });
+
+  it('still requires signatures from official', async () => {
+    setCatalogSource('official');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(catalogOf(existingAsCatalogModels())))));
+
+    const result = await syncCatalog(true);
+
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('catalog response missing signature');
+  });
+
+  it('switching official to community re-applies at an identical version+tier', async () => {
+    const catalog = catalogOf(existingAsCatalogModels());
+    setSetting('catalog_applied_version', catalog.version);
+    setSetting('catalog_applied_tier', catalog.tier);
+    setSetting('catalog_applied_json', JSON.stringify(catalog));
+    setSetting('catalog_applied_source', 'official');
+
+    process.env.COMMUNITY_CATALOG_BASE_URL = 'https://community.example';
+    setCatalogSource('community');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(catalog))));
+
+    const result = await syncCatalog(true);
+
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe('applied');
+    expect(getSetting('catalog_applied_source')).toBe('community');
+  });
+
+  it('switching community to official re-applies at an identical version+tier', async () => {
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    process.env.CATALOG_PUBKEY = publicKey.export({ type: 'spki', format: 'pem' }) as string;
+    const catalog = catalogOf(existingAsCatalogModels());
+    const body = Buffer.from(JSON.stringify(catalog), 'utf8');
+    const signature = crypto.sign(null, body, privateKey).toString('base64');
+    setSetting('catalog_applied_version', catalog.version);
+    setSetting('catalog_applied_tier', catalog.tier);
+    setSetting('catalog_applied_json', JSON.stringify(catalog));
+    setSetting('catalog_applied_source', 'community');
+
+    setCatalogSource('official');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, { headers: { 'x-catalog-signature': signature } })));
+
+    const result = await syncCatalog(true);
+
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe('applied');
+    expect(getSetting('catalog_applied_source')).toBe('official');
+  });
+
+  it('rejects a malformed community payload via isCatalog', async () => {
+    process.env.COMMUNITY_CATALOG_BASE_URL = 'https://community.example';
+    setCatalogSource('community');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ version: '2099.01.01', tier: 'live' }))));
+
+    const result = await syncCatalog(true);
+
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('unexpected shape');
+  });
+
+  it('skips a community catalog older than MIN_CATALOG_VERSION without applying', async () => {
+    process.env.COMMUNITY_CATALOG_BASE_URL = 'https://community.example';
+    setCatalogSource('community');
+    const stale = catalogOf(existingAsCatalogModels());
+    stale.version = '2000.01.01';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(stale))));
+
+    const result = await syncCatalog(true);
+
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe('skipped_older');
+    expect(getSetting('catalog_applied_version')).not.toBe('2000.01.01');
+  });
+
+  it('records network failures in catalog_last_error', async () => {
+    setCatalogSource('community');
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('connection refused');
+    }));
+
+    const result = await syncCatalog(true);
+
+    expect(result.ok).toBe(false);
+    expect(result.action).toBe('error');
+    expect(getSetting('catalog_last_error')).toContain('connection refused');
+  });
+
+  it('manual sync fetches the configured community URL', async () => {
+    process.env.COMMUNITY_CATALOG_BASE_URL = 'https://catalog.example.me/v-root';
+    setCatalogSource('community');
+    let requestedUrl = '';
+    vi.stubGlobal('fetch', vi.fn(async (input: URL | RequestInfo) => {
+      requestedUrl = String(input);
+      return new Response(JSON.stringify(catalogOf(existingAsCatalogModels())));
+    }));
+
+    const result = await syncCatalog(true);
+
+    expect(result.ok).toBe(true);
+    expect(result.action).toBe('applied');
+    expect(requestedUrl.startsWith('https://catalog.example.me/v-root')).toBe(true);
+    expect(requestedUrl.endsWith('/v1/latest')).toBe(true);
+  });
+
+  it('getSyncState reports the configured community source and snapshot', async () => {
+    process.env.COMMUNITY_CATALOG_BASE_URL = 'https://catalog.example.me/v-root';
+    setSetting('catalog_applied_source', 'official');
+    setCatalogSource('community');
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(catalogOf(existingAsCatalogModels())))));
+
+    const result = await syncCatalog(true);
+    expect(result.action).toBe('applied');
+
+    const state = getSyncState();
+    expect(state.source).toBe('community');
+    expect(state.baseUrl).toBe('https://catalog.example.me/v-root');
+    expect(state.snapshot?.version).toBe('2099.01.01');
+    expect(state.changes).toBeTruthy();
   });
 });

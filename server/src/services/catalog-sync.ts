@@ -37,6 +37,8 @@ const MEDIA_MODALITIES = new Set(['image', 'audio']);
  */
 
 const DEFAULT_BASE_URL = 'https://api.freellmapi.co';
+// Community feed default value only; COMMUNITY_CATALOG_BASE_URL overrides it without code changes.
+const DEFAULT_COMMUNITY_BASE_URL = 'https://naster17.github.io/freellmapi-catalog';
 
 // The Ed25519 public key the production catalog is signed with. The private
 // half was generated on the catalog host and has never left it. Self-hosters
@@ -52,19 +54,39 @@ export const MIN_CATALOG_VERSION = '2026.06.07';
 
 const SYNC_INTERVAL_MS = 12 * 60 * 60 * 1000; // twice daily
 const BOOT_DELAY_MS = 10 * 1000; // let the server settle before first sync
-const FETCH_TIMEOUT_MS = 20 * 1000;
+const FETCH_TIMEOUT_MS = 60 * 1000;
 
 // settings table keys
 export const SETTING_LICENSE_KEY = 'premium_license_key';
 export const SETTING_LICENSE_STATUS = 'premium_license_status'; // JSON LicenseStatus
 const SETTING_APPLIED_VERSION = 'catalog_applied_version';
 const SETTING_APPLIED_TIER = 'catalog_applied_tier';
+const SETTING_APPLIED_SOURCE = 'catalog_applied_source';
 const SETTING_APPLIED_JSON = 'catalog_applied_json';
+const SETTING_PREVIOUS_JSON = 'catalog_previous_json';
 const SETTING_LAST_SYNC_MS = 'catalog_last_sync_ms';
 const SETTING_LAST_ERROR = 'catalog_last_error';
+export const SETTING_CATALOG_SOURCE = 'catalog_source';
 
-export function catalogBaseUrl(): string {
+export type CatalogSource = 'official' | 'community';
+
+export function catalogSource(): CatalogSource {
+  return getSetting(SETTING_CATALOG_SOURCE) === 'official' ? 'official' : 'community';
+}
+
+export function setCatalogSource(source: CatalogSource): void {
+  setSetting(SETTING_CATALOG_SOURCE, source);
+}
+
+export function officialCatalogBaseUrl(): string {
   return (process.env.CATALOG_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/$/, '');
+}
+
+export function catalogBaseUrl(source: CatalogSource = catalogSource()): string {
+  if (source === 'community') {
+    return (process.env.COMMUNITY_CATALOG_BASE_URL ?? DEFAULT_COMMUNITY_BASE_URL).replace(/\/$/, '');
+  }
+  return officialCatalogBaseUrl();
 }
 
 function catalogPublicKey(): crypto.KeyObject {
@@ -252,6 +274,151 @@ function isCatalog(value: unknown): value is Catalog {
 function routableContextWindow(platform: string, modelId: string, contextWindow: number | null): number | null {
   if (platform === 'github' && modelId === 'openai/gpt-4.1') return 8000;
   return contextWindow;
+}
+
+export interface CatalogSnapshotSummary {
+  version: string;
+  generatedAt: string;
+  tier: 'live' | 'monthly';
+  totalModels: number;
+  enabledModels: number;
+  platforms: number;
+  quirks: number;
+}
+
+export interface CatalogModelChange {
+  key: string;
+  platform: string;
+  modelId: string;
+  displayName: string;
+  fields: string[];
+}
+
+export interface CatalogDiffSummary {
+  hasPrevious: boolean;
+  fromVersion: string | null;
+  fromTier: 'live' | 'monthly' | null;
+  toVersion: string;
+  toTier: 'live' | 'monthly';
+  added: CatalogModelChange[];
+  removed: CatalogModelChange[];
+  changed: CatalogModelChange[];
+  quirks: { added: string[]; removed: string[]; changed: string[] };
+  counts: {
+    added: number;
+    removed: number;
+    changed: number;
+    quirksAdded: number;
+    quirksRemoved: number;
+    quirksChanged: number;
+  };
+}
+
+function parseCatalogSetting(key: string): Catalog | null {
+  const raw = getSetting(key);
+  if (!raw) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return isCatalog(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function modelKey(model: CatalogModel): string {
+  return `${model.platform}:${model.modelId}`;
+}
+
+function summarizeCatalog(catalog: Catalog): CatalogSnapshotSummary {
+  return {
+    version: catalog.version,
+    generatedAt: catalog.generatedAt,
+    tier: catalog.tier,
+    totalModels: catalog.models.length,
+    enabledModels: catalog.models.filter((m) => m.enabled).length,
+    platforms: new Set(catalog.models.map((m) => m.platform)).size,
+    quirks: catalog.quirks.length,
+  };
+}
+
+function asModelChange(model: CatalogModel, fields: string[] = []): CatalogModelChange {
+  return {
+    key: modelKey(model),
+    platform: model.platform,
+    modelId: model.modelId,
+    displayName: model.displayName,
+    fields,
+  };
+}
+
+function changedModelFields(before: CatalogModel, after: CatalogModel): string[] {
+  const fields: string[] = [];
+  if (before.displayName !== after.displayName) fields.push('name');
+  if (before.enabled !== after.enabled) fields.push('availability');
+  if (before.intelligenceRank !== after.intelligenceRank || before.speedRank !== after.speedRank) fields.push('ranking');
+  if (before.sizeLabel !== after.sizeLabel) fields.push('size');
+  if (JSON.stringify(before.limits) !== JSON.stringify(after.limits)) fields.push('limits');
+  if (before.monthlyTokenBudget !== after.monthlyTokenBudget) fields.push('quota');
+  if (before.contextWindow !== after.contextWindow) fields.push('context');
+  if (before.supportsVision !== after.supportsVision || before.supportsTools !== after.supportsTools) fields.push('capabilities');
+  return fields;
+}
+
+function diffCatalogs(previous: Catalog | null, current: Catalog): CatalogDiffSummary {
+  const added: CatalogModelChange[] = [];
+  const removed: CatalogModelChange[] = [];
+  const changed: CatalogModelChange[] = [];
+  const quirks = { added: [] as string[], removed: [] as string[], changed: [] as string[] };
+
+  if (previous) {
+    const previousModels = new Map(previous.models.map((model) => [modelKey(model), model]));
+    const currentModels = new Map(current.models.map((model) => [modelKey(model), model]));
+
+    for (const model of current.models) {
+      const before = previousModels.get(modelKey(model));
+      if (!before) {
+        added.push(asModelChange(model));
+        continue;
+      }
+      const fields = changedModelFields(before, model);
+      if (fields.length > 0) changed.push(asModelChange(model, fields));
+    }
+
+    for (const model of previous.models) {
+      if (!currentModels.has(modelKey(model))) removed.push(asModelChange(model));
+    }
+
+    const previousQuirks = new Map(previous.quirks.map((quirk) => [quirk.slug, quirk]));
+    const currentQuirks = new Map(current.quirks.map((quirk) => [quirk.slug, quirk]));
+    for (const quirk of current.quirks) {
+      const before = previousQuirks.get(quirk.slug);
+      if (!before) quirks.added.push(quirk.title);
+      else if (JSON.stringify(before) !== JSON.stringify(quirk)) quirks.changed.push(quirk.title);
+    }
+    for (const quirk of previous.quirks) {
+      if (!currentQuirks.has(quirk.slug)) quirks.removed.push(quirk.title);
+    }
+  }
+
+  return {
+    hasPrevious: Boolean(previous),
+    fromVersion: previous?.version ?? null,
+    fromTier: previous?.tier ?? null,
+    toVersion: current.version,
+    toTier: current.tier,
+    added,
+    removed,
+    changed,
+    quirks,
+    counts: {
+      added: added.length,
+      removed: removed.length,
+      changed: changed.length,
+      quirksAdded: quirks.added.length,
+      quirksRemoved: quirks.removed.length,
+      quirksChanged: quirks.changed.length,
+    },
+  };
 }
 
 /**
@@ -673,13 +840,14 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
  */
 export async function syncCatalog(force = false): Promise<SyncResult> {
   const db = getDb();
+  const source = catalogSource();
   const key = getSetting(SETTING_LICENSE_KEY);
   const applied = getSetting(SETTING_APPLIED_VERSION);
 
   try {
     const headers: Record<string, string> = {};
-    if (key) headers.Authorization = `Bearer ${key}`;
-    const url = new URL(`${catalogBaseUrl()}/v1/latest`);
+    if (source === 'official' && key) headers.Authorization = `Bearer ${key}`;
+    const url = new URL(`${catalogBaseUrl(source)}/v1/latest`);
     if (applied && !force) url.searchParams.set('since', applied);
 
     const res = await fetch(url, { headers, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
@@ -691,11 +859,17 @@ export async function syncCatalog(force = false): Promise<SyncResult> {
     }
     if (!res.ok) throw new Error(`catalog fetch failed: HTTP ${res.status}`);
 
-    const signature = res.headers.get('x-catalog-signature');
-    if (!signature) throw new Error('catalog response missing signature');
     const bytes = Buffer.from(await res.arrayBuffer());
-    const verified = crypto.verify(null, bytes, catalogPublicKey(), Buffer.from(signature, 'base64'));
-    if (!verified) throw new Error('catalog signature verification FAILED — discarding response');
+    // Trust is keyed by source identity, not URL: the community source applies
+    // the unsigned policy to whatever URL is configured. Pointing
+    // COMMUNITY_CATALOG_BASE_URL at api.freellmapi.co does NOT grant official
+    // verification and must be avoided.
+    if (source === 'official') {
+      const signature = res.headers.get('x-catalog-signature');
+      if (!signature) throw new Error('catalog response missing signature');
+      const verified = crypto.verify(null, bytes, catalogPublicKey(), Buffer.from(signature, 'base64'));
+      if (!verified) throw new Error('catalog signature verification FAILED — discarding response');
+    }
 
     const parsed: unknown = JSON.parse(bytes.toString('utf8'));
     if (!isCatalog(parsed)) throw new Error('catalog payload has unexpected shape');
@@ -709,18 +883,24 @@ export async function syncCatalog(force = false): Promise<SyncResult> {
       return { ok: true, action: 'skipped_older', version: catalog.version, tier: catalog.tier };
     }
 
-    const sameAsApplied = applied === catalog.version && getSetting(SETTING_APPLIED_TIER) === catalog.tier;
+    const sameAsApplied =
+      applied === catalog.version &&
+      getSetting(SETTING_APPLIED_TIER) === catalog.tier &&
+      (getSetting(SETTING_APPLIED_SOURCE) ?? 'official') === source;
     if (!sameAsApplied) {
+      const previousCatalogRaw = getSetting(SETTING_APPLIED_JSON);
       const counts = applyCatalog(db, catalog);
       setSetting(SETTING_APPLIED_VERSION, catalog.version);
       setSetting(SETTING_APPLIED_TIER, catalog.tier);
+      setSetting(SETTING_APPLIED_SOURCE, source);
+      if (previousCatalogRaw) setSetting(SETTING_PREVIOUS_JSON, previousCatalogRaw);
       // Cache the verified document so boots can re-apply it offline (see
       // reapplyCachedCatalog). Stored post-verification: anything that could
       // tamper this row could tamper the models table directly, so the cache
       // adds no new trust surface.
       setSetting(SETTING_APPLIED_JSON, bytes.toString('utf8'));
       console.log(
-        `[catalog-sync] applied ${catalog.tier} v${catalog.version}: ` +
+        `[catalog-sync] applied ${source} ${catalog.tier} v${catalog.version}: ` +
           `${counts.updated} updated, ${counts.inserted} new, ${counts.removed} removed, ` +
           `${counts.quirks} quirks` +
           (counts.skippedUnknownPlatform ? `, ${counts.skippedUnknownPlatform} skipped (unknown platform)` : ''),
@@ -746,7 +926,7 @@ export async function refreshLicenseStatus(): Promise<LicenseStatus | null> {
   const key = getSetting(SETTING_LICENSE_KEY);
   if (!key) return null;
   try {
-    const res = await fetch(`${catalogBaseUrl()}/v1/license/check`, {
+    const res = await fetch(`${officialCatalogBaseUrl()}/v1/license/check`, {
       headers: { Authorization: `Bearer ${key}` },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
@@ -774,20 +954,31 @@ export function getCachedLicenseStatus(): LicenseStatus | null {
 }
 
 export interface CatalogSyncState {
+  source: CatalogSource;
   baseUrl: string;
   appliedVersion: string | null;
   appliedTier: string | null;
+  appliedSource: string | null;
   lastSyncMs: number | null;
   lastError: string | null;
+  snapshot: CatalogSnapshotSummary | null;
+  changes: CatalogDiffSummary | null;
 }
 
 export function getSyncState(): CatalogSyncState {
+  const source = catalogSource();
+  const current = parseCatalogSetting(SETTING_APPLIED_JSON);
+  const previous = parseCatalogSetting(SETTING_PREVIOUS_JSON);
   return {
-    baseUrl: catalogBaseUrl(),
+    source,
+    baseUrl: catalogBaseUrl(source),
     appliedVersion: getSetting(SETTING_APPLIED_VERSION) ?? null,
     appliedTier: getSetting(SETTING_APPLIED_TIER) ?? null,
+    appliedSource: getSetting(SETTING_APPLIED_SOURCE) ?? null,
     lastSyncMs: Number(getSetting(SETTING_LAST_SYNC_MS)) || null,
     lastError: getSetting(SETTING_LAST_ERROR) || null,
+    snapshot: current ? summarizeCatalog(current) : null,
+    changes: current ? diffCatalogs(previous, current) : null,
   };
 }
 
